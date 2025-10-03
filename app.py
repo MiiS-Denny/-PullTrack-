@@ -1,9 +1,8 @@
-
 import io
 import os
 import re
 import hmac
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 
 import streamlit as st
@@ -32,8 +31,8 @@ PWD_DB = {
     "Ping":    {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "4af5ee4403ad13cb6a2b0836da5d02b1", "hash": "1c1757b927959d2ef8897467f1c823753ec166f0d5c0a1a8ed5d91a84f2ab00d"},
     "Denny":   {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "bc88ba930b619a25dcce81e6ee616305", "hash": "3dfe81a7dd31acaf2816604c000637f328049d1ca9f13940e217ec51f3a5e7c7"},
     "Davina":  {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "8ce1cb7106316a21db1b48534d7d1833", "hash": "3a79b1feaa96cd7dc7dbced0bc2226d84da22ecda5a38d7d44a58f98e8c24b96"},
-    "Arthur": {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "8e9a0b3e6c6dd1dccd6964101b5af752", "hash": "0409292dedb20de507c7fae67d25f502998c80cb4fcace6758d8fedc042d5570"},
-
+    # 如果你已加入 Arthur，保持既有設定
+    "Arthur": {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "...", "hash": "..."},
 }
 
 def verify_password(username: str, password: str) -> bool:
@@ -105,14 +104,17 @@ def refresh_existing_two_charts(ws, last_row):
         _reset_chart_series_to_cols(ws, charts[1], (COL_R, COL_CL_R, COL_UCL_R, COL_LCL_R), last_row)
 
 def normalize_value_to_yyyymmdd(v) -> str | None:
-    """把任意儲存格值轉成 YYYYMMDD；無法判讀則回 None。"""
+    """把任意儲存格值轉成 YYYYMMDD；允許結尾 -N 例如 20251003-2。無法判讀則回 None。"""
     if v is None or v == "":
         return None
     if isinstance(v, datetime):
         return v.strftime("%Y%m%d")
     s = str(v).strip()
-    if re.fullmatch(r"\d{8}", s):
-        return s
+    # 允許 YYYYMMDD 或 YYYYMMDD-序號
+    m = re.fullmatch(r"(\d{8})(?:-(\d+))?", s)
+    if m:
+        return m.group(1)
+    # 也允許 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD 等
     m = re.fullmatch(r"(\d{4})[-/\.]?(\d{1,2})[-/\.]?(\d{1,2})", s)
     if m:
         y, mo, d = m.groups()
@@ -128,47 +130,51 @@ def read_last_date_str_from_wb(wb, sheet_name=SHEET_NAME) -> str:
     ymd = normalize_value_to_yyyymmdd(v)
     return ymd or ""
 
-def read_all_dates_from_ws(ws) -> set[str]:
-    """讀取 A 欄所有有效日期（第 2 列起），回傳 YYYYMMDD 字串集合。"""
+def read_all_dates_from_ws(ws) -> list[str]:
+    """讀取 A 欄所有有效日期（第 2 列起），回傳 YYYYMMDD 字串串列（可能重複）。"""
     last = find_last_data_row(ws, col=COL_DATE)
-    dates = set()
+    dates = []
     for r in range(2, last + 1):
         ymd = normalize_value_to_yyyymmdd(ws.cell(row=r, column=COL_DATE).value)
         if ymd:
-            dates.add(ymd)
+            dates.append(ymd)
     return dates
 
-def _append_one(ws, date_str: str, values: list[float], owner_text: str):
+def _append_one(ws, date_str: str, values: list[float], owner_text: str, seq_for_same_day: int | None):
+    """seq_for_same_day: 若為 1,2,3... 則在 A 欄寫 YYYYMMDD-1 / -2 / ...；None 則寫 YYYYMMDD"""
     last_row = find_last_data_row(ws, col=COL_DATE)
     new_row = last_row + 1
     copy_row_styles(ws, from_row=last_row, to_row=new_row, col_start=COL_DATE, col_end=COL_LCL_R)
-    ws.cell(row=new_row, column=COL_DATE).value = str(date_str)
+
+    if seq_for_same_day is None:
+        ws.cell(row=new_row, column=COL_DATE).value = str(date_str)
+    else:
+        ws.cell(row=new_row, column=COL_DATE).value = f"{date_str}-{seq_for_same_day}"
+
     for i, col in enumerate(range(COL_V_START, COL_V_END + 1), start=1):
         ws.cell(row=new_row, column=col).value = values[i-1]
+
     v_start = ws.cell(row=new_row, column=COL_V_START).coordinate
     v_end   = ws.cell(row=new_row, column=COL_V_END).coordinate
     ws.cell(row=new_row, column=COL_XBAR).value = f"=AVERAGE({v_start}:{v_end})"
     ws.cell(row=new_row, column=COL_R).value    = f"=MAX({v_start}:{v_end})-MIN({v_start}:{v_end})"
+
     if last_row >= 2:
         for col in (COL_CL_XBAR, COL_UCL_XBAR, COL_LCL_XBAR, COL_CL_R, COL_UCL_R, COL_LCL_R):
             ws.cell(row=new_row, column=col).value = ws.cell(row=last_row, column=col).value
+
     pcell = ws.cell(row=new_row, column=COL_OWNER)
     pcell.value = owner_text or ""
     pcell.font = Font(name="Calibri", size=11)
     return new_row
 
-def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: str, sheet_name=SHEET_NAME):
+def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: str, sheet_name=SHEET_NAME,
+                      allow_same_day_multi: bool = False, same_day_dates_confirmed: set[str] | None = None):
     """
     回傳：(last_used_date_for_name:str, out_bytes:bytes, reorder_info:dict)
-    - 自動將 rows_to_add 中「有填日期」的列依日期排序（由小到大）再寫入
-    - 若有日期重複（本次輸入彼此重複、或與範本已存在重複）→ raise
-    - reorder_info: {
-        "original_order": [YYYYMMDD...],
-        "sorted_order":   [YYYYMMDD...],
-        "was_reordered":  bool,
-        "wb_last_date":   "YYYYMMDD" or "",
-        "has_earlier_than_wb": bool
-      }
+    - 若 allow_same_day_multi=False，遇到與本次輸入彼此或與範本重複的日期會 raise
+    - 若 allow_same_day_multi=True，允許同日多筆，並將同日的列在 A 欄標示為 YYYYMMDD-1, -2, ...
+      * 僅針對 'same_day_dates_confirmed' 內的日期加 -1/-2，其他仍維持 YYYYMMDD
     """
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
     if sheet_name not in wb.sheetnames:
@@ -179,7 +185,8 @@ def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: s
     # 讀取範本資訊
     wb_last_date_str = read_last_date_str_from_wb(wb, sheet_name)
     wb_last_date_int = int(wb_last_date_str) if wb_last_date_str.isdigit() else None
-    existing_dates = read_all_dates_from_ws(ws)  # A 欄所有已存在日期（YYYYMMDD）
+    existing_dates_list = read_all_dates_from_ws(ws)  # A 欄所有已存在日期（YYYYMMDD，可重複）
+    existing_dates_set = set(existing_dates_list)
 
     # 收集本次有填日期的列
     collected = []
@@ -204,18 +211,24 @@ def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: s
         wb.close()
         raise ValueError("沒有可新增的資料：12 列輸入中的日期全為空白")
 
-    # 1) 檢查：本次輸入彼此有無重複日期
+    # 1) 檢查：本次輸入彼此是否有重複
     cnt = Counter([r["date"] for r in collected])
     dups_input = sorted([d for d, n in cnt.items() if n > 1])
-    if dups_input:
-        wb.close()
-        raise ValueError("偵測到本次輸入的日期重複，已取消執行：\n  - " + ", ".join(dups_input))
 
     # 2) 檢查：是否與範本既有日期重複
-    dups_with_wb = sorted([d for d in cnt.keys() if d in existing_dates])
-    if dups_with_wb:
+    dups_with_wb = sorted([d for d in cnt.keys() if d in existing_dates_set])
+
+    # 若不允許同日多筆，且偵測到重複，直接擋下
+    need_confirm = bool(dups_input or dups_with_wb)
+    if need_confirm and not allow_same_day_multi:
         wb.close()
-        raise ValueError("偵測到與範本內既有日期重複，已取消執行：\n  - " + ", ".join(dups_with_wb))
+        # 用統一訊息指出可能的兩種重複來源
+        msg_lines = []
+        if dups_input:
+            msg_lines.append("・本次輸入彼此重複： " + ", ".join(dups_input))
+        if dups_with_wb:
+            msg_lines.append("・與範本內既有日期重複： " + ", ".join(dups_with_wb))
+        raise ValueError("偵測到同日多筆資料。\n" + "\n".join(msg_lines))
 
     # 自動排序（由小到大）
     sorted_rows = sorted(collected, key=lambda r: int(r["date"]))
@@ -230,9 +243,21 @@ def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: s
 
     # 寫入（用排序後的順序）
     last_used_date_for_name = None
+
+    # 決定哪些日期需要加 -1/-2（只對被使用者「確認要多筆」的日期做標註）
+    confirmed_set = set(same_day_dates_confirmed or [])
+
+    # 計算本次批次內對於每一個「需標註的日期」的序號
+    per_date_running_idx = defaultdict(int)
+
     for item in sorted_rows:
-        _append_one(ws, item["date"], item["values"], item["owner"])
-        last_used_date_for_name = item["date"]
+        d = item["date"]
+        seq = None
+        if d in confirmed_set:
+            per_date_running_idx[d] += 1
+            seq = per_date_running_idx[d]  # 1,2,3...
+        _append_one(ws, d, item["values"], item["owner"], seq_for_same_day=seq)
+        last_used_date_for_name = d
 
     # 更新圖表資料範圍
     last_row_after = find_last_data_row(ws, col=COL_DATE)
@@ -249,6 +274,9 @@ def append_many_bytes(template_bytes: bytes, rows_to_add: list, template_name: s
         "was_reordered": was_reordered,
         "wb_last_date": wb_last_date_str,
         "has_earlier_than_wb": has_earlier_than_wb,
+        "dups_input": dups_input,
+        "dups_with_wb": dups_with_wb,
+        "confirmed_dates": sorted(list(confirmed_set)),
     }
     return last_used_date_for_name, out_bytes, reorder_info
 
@@ -264,6 +292,10 @@ if "last_reorder_info" not in st.session_state: st.session_state.last_reorder_in
 if "login_user" not in st.session_state: st.session_state.login_user = list(PWD_DB.keys())[0]
 if "login_pwd" not in st.session_state: st.session_state.login_pwd = ""
 if "login_error" not in st.session_state: st.session_state.login_error = ""
+
+# 新增：用於「同日多筆」的互動流程
+if "pending_dups" not in st.session_state: st.session_state.pending_dups = None  # dict 存待確認資訊
+if "dup_confirmed" not in st.session_state: st.session_state.dup_confirmed = False
 
 # ---- 登入（非 form；Enter 一次就進）----
 def attempt_login():
@@ -343,13 +375,24 @@ with st.form("input_form"):
         if not tpl_file:
             st.error("請先上傳 Excel 範本（.xlsx）。")
         else:
+            # 第一次送出：先嘗試不允許同日多筆，若偵測到重複，改用「互動確認」流程
             try:
-                # 產出（內部含排序；同時會檢查日期重複，若重複會 raise）
+                # 先只做檢查，不允許同日多筆（遇到重複會 raise）
+                _ = append_many_bytes(
+                    template_bytes=tpl_file.getvalue(),
+                    rows_to_add=rows,
+                    template_name=tpl_file.name,
+                    sheet_name=SHEET_NAME,
+                    allow_same_day_multi=False
+                )
+                # 若能走到這裡，代表沒有任何重複，直接正式執行（這次才真的產生輸出）
                 last_date_added, out_bytes, reorder_info = append_many_bytes(
                     template_bytes=tpl_file.getvalue(),
                     rows_to_add=rows,
                     template_name=tpl_file.name,
-                    sheet_name=SHEET_NAME
+                    sheet_name=SHEET_NAME,
+                    allow_same_day_multi=True,  # 沒有重複，設 True/False 都可
+                    same_day_dates_confirmed=set()
                 )
 
                 # 檔名以當下台北時間為準
@@ -370,10 +413,75 @@ with st.form("input_form"):
                 st.session_state.last_reorder_info = reorder_info
 
                 st.success(f"已產生：**{out_name}**（請往下滑看下載鈕與提醒）")
+
             except Exception as e:
-                st.session_state.last_result = None
-                st.session_state.last_reorder_info = None
+                # 如果是「同日多筆」被擋下，進入互動確認流程
+                msg = str(e)
+                if "偵測到同日多筆資料" in msg:
+                    # 解析需要使用者確認的日期清單（可能包含兩種來源）
+                    # 從訊息抽出 YYYYMMDD
+                    dup_dates = sorted(set(re.findall(r"\b(\d{8})\b", msg)))
+                    if not dup_dates:
+                        st.error(f"發生錯誤：{e}")
+                    else:
+                        st.session_state.pending_dups = {
+                            "tpl_name": tpl_file.name,
+                            "tpl_bytes": tpl_file.getvalue(),
+                            "rows": rows,
+                            "dup_dates": dup_dates,
+                        }
+                        st.session_state.last_result = None
+                        st.session_state.last_reorder_info = None
+                        st.warning("偵測到同日多筆資料，請於下方確認是否允許。")
+                else:
+                    st.session_state.last_result = None
+                    st.session_state.last_reorder_info = None
+                    st.error(f"發生錯誤：{e}")
+
+# ---- 「同日多筆」互動區（在表單外）----
+if st.session_state.pending_dups:
+    st.markdown("---")
+    st.subheader("⚠️ 偵測到同日多筆資料")
+    pd = st.session_state.pending_dups
+    with st.expander("查看重複日期（本次輸入彼此或與範本重複）", expanded=True):
+        st.write(", ".join(pd["dup_dates"]))
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("✅ 是，我確認此等日期可有多筆紀錄（將標示 -1/-2/...）", type="primary", use_container_width=True):
+            try:
+                last_date_added, out_bytes, reorder_info = append_many_bytes(
+                    template_bytes=pd["tpl_bytes"],
+                    rows_to_add=pd["rows"],
+                    template_name=pd["tpl_name"],
+                    sheet_name=SHEET_NAME,
+                    allow_same_day_multi=True,
+                    same_day_dates_confirmed=set(pd["dup_dates"])
+                )
+                now = datetime.now(TZ) if TZ else datetime.now()
+                dstr = now.strftime("%Y%m%d")
+                hhmm = now.strftime("%H%M")
+                prefix = f"{FIXED_BASE}-{dstr}-{hhmm}-"
+                n = st.session_state.seq.get(prefix, 0) + 1
+                st.session_state.seq[prefix] = n
+                out_name = f"{prefix}{n:03d}.xlsx"
+
+                st.session_state.last_result = {
+                    "out_name": out_name,
+                    "out_bytes": out_bytes,
+                    "last_date_added": last_date_added,
+                    "generated_at": f"{dstr} {hhmm}",
+                }
+                st.session_state.last_reorder_info = reorder_info
+                st.session_state.pending_dups = None
+                st.success("已允許同日多筆，並完成輸出。請往下滑下載。")
+            except Exception as e:
                 st.error(f"發生錯誤：{e}")
+
+    with c2:
+        if st.button("❌ 否，取消此次輸入", use_container_width=True):
+            st.session_state.pending_dups = None
+            st.info("已取消此次輸入。")
 
 # ---- 表單外：下載與提醒 ----
 if st.session_state.last_result:
@@ -409,3 +517,6 @@ if st.session_state.last_result:
             icon="🕒"
         )
 
+    confirmed_dates = info.get("confirmed_dates") or []
+    if confirmed_dates:
+        st.info("以下日期已依序加上 -1 / -2 / ... 標示： " + ", ".join(confirmed_dates))
