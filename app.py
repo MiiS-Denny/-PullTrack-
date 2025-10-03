@@ -32,7 +32,8 @@ PWD_DB = {
     "Denny":   {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "bc88ba930b619a25dcce81e6ee616305", "hash": "3dfe81a7dd31acaf2816604c000637f328049d1ca9f13940e217ec51f3a5e7c7"},
     "Davina":  {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "8ce1cb7106316a21db1b48534d7d1833", "hash": "3a79b1feaa96cd7dc7dbced0bc2226d84da22ecda5a38d7d44a58f98e8c24b96"},
     # 如果你已加入 Arthur，保持既有設定
-    "Arthur": {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "...", "hash": "..."},
+    "Arthur": {"algo": "pbkdf2_sha256", "iter": 200000, "salt": "8e9a0b3e6c6dd1dccd6964101b5af752", "hash": "0409292dedb20de507c7fae67d25f502998c80cb4fcace6758d8fedc042d5570"},
+
 }
 
 def verify_password(username: str, password: str) -> bool:
@@ -520,3 +521,4 @@ if st.session_state.last_result:
     confirmed_dates = info.get("confirmed_dates") or []
     if confirmed_dates:
         st.info("以下日期已依序加上 -1 / -2 / ... 標示： " + ", ".join(confirmed_dates))
+
